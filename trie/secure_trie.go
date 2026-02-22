@@ -96,6 +96,12 @@ func NewStateTrie(id *ID, db database.NodeDatabase) (*StateTrie, error) {
 	return tr, nil
 }
 
+// SetNodeArena sets the typed arena for trie node allocations on the
+// underlying trie.
+func (t *StateTrie) SetNodeArena(arena *NodeArena) {
+	t.trie.SetNodeArena(arena)
+}
+
 // MustGet returns the value for key stored in the trie.
 // The value bytes must not be modified by the caller.
 //

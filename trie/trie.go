@@ -60,11 +60,43 @@ type Trie struct {
 	// Various tracers for capturing the modifications to trie
 	opTracer       *opTracer
 	prevalueTracer *PrevalueTracer
+
+	// nodeArena is an optional typed arena for allocating trie nodes.
+	// When set, fullNode and shortNode allocations use the arena instead
+	// of the heap. The arena must outlive the trie.
+	nodeArena *NodeArena
+}
+
+// SetNodeArena sets the typed arena for trie node allocations.
+// When set, fullNode and shortNode allocations use the arena instead of
+// the heap. Pass nil to revert to heap allocation.
+func (t *Trie) SetNodeArena(arena *NodeArena) {
+	t.nodeArena = arena
 }
 
 // newFlag returns the cache flag value for a newly created node.
 func (t *Trie) newFlag() nodeFlag {
 	return nodeFlag{dirty: true}
+}
+
+// newFullNode allocates a fullNode, using the arena if available.
+func (t *Trie) newFullNode() *fullNode {
+	if t.nodeArena != nil {
+		return t.nodeArena.NewFullNode()
+	}
+	return new(fullNode)
+}
+
+// newShortNode allocates a shortNode, using the arena if available.
+func (t *Trie) newShortNode(key []byte, val node, flag nodeFlag) *shortNode {
+	if t.nodeArena != nil {
+		n := t.nodeArena.NewShortNode()
+		n.Key = key
+		n.Val = val
+		n.flags = flag
+		return n
+	}
+	return &shortNode{Key: key, Val: val, flags: flag}
 }
 
 // Copy returns a copy of Trie.
@@ -419,10 +451,11 @@ func (t *Trie) insert(n node, prefix, key []byte, value node) (bool, node, error
 			if !dirty || err != nil {
 				return false, n, err
 			}
-			return true, &shortNode{n.Key, nn, t.newFlag()}, nil
+			return true, t.newShortNode(n.Key, nn, t.newFlag()), nil
 		}
 		// Otherwise branch out at the index where they differ.
-		branch := &fullNode{flags: t.newFlag()}
+		branch := t.newFullNode()
+		branch.flags = t.newFlag()
 		var err error
 		_, branch.Children[n.Key[matchlen]], err = t.insert(nil, append(prefix, n.Key[:matchlen+1]...), n.Key[matchlen+1:], n.Val)
 		if err != nil {
@@ -442,7 +475,7 @@ func (t *Trie) insert(n node, prefix, key []byte, value node) (bool, node, error
 		t.opTracer.onInsert(append(prefix, key[:matchlen]...))
 
 		// Replace it with a short node leading up to the branch.
-		return true, &shortNode{key[:matchlen], branch, t.newFlag()}, nil
+		return true, t.newShortNode(key[:matchlen], branch, t.newFlag()), nil
 
 	case *fullNode:
 		dirty, nn, err := t.insert(n.Children[key[0]], append(prefix, key[0]), key[1:], value)
@@ -459,7 +492,7 @@ func (t *Trie) insert(n node, prefix, key []byte, value node) (bool, node, error
 		// since it's always embedded in its parent.
 		t.opTracer.onInsert(prefix)
 
-		return true, &shortNode{key, value, t.newFlag()}, nil
+		return true, t.newShortNode(key, value, t.newFlag()), nil
 
 	case hashNode:
 		// We've hit a part of the trie that isn't loaded yet. Load
@@ -546,9 +579,9 @@ func (t *Trie) delete(n node, prefix, key []byte) (bool, node, error) {
 			// always creates a new slice) instead of append to
 			// avoid modifying n.Key since it might be shared with
 			// other nodes.
-			return true, &shortNode{slices.Concat(n.Key, child.Key), child.Val, t.newFlag()}, nil
+			return true, t.newShortNode(slices.Concat(n.Key, child.Key), child.Val, t.newFlag()), nil
 		default:
-			return true, &shortNode{n.Key, child, t.newFlag()}, nil
+			return true, t.newShortNode(n.Key, child, t.newFlag()), nil
 		}
 
 	case *fullNode:
@@ -606,12 +639,12 @@ func (t *Trie) delete(n node, prefix, key []byte) (bool, node, error) {
 					t.opTracer.onDelete(append(prefix, byte(pos)))
 
 					k := append([]byte{byte(pos)}, cnode.Key...)
-					return true, &shortNode{k, cnode.Val, t.newFlag()}, nil
+					return true, t.newShortNode(k, cnode.Val, t.newFlag()), nil
 				}
 			}
 			// Otherwise, n is replaced by a one-nibble short node
 			// containing the child.
-			return true, &shortNode{[]byte{byte(pos)}, n.Children[pos], t.newFlag()}, nil
+			return true, t.newShortNode([]byte{byte(pos)}, n.Children[pos], t.newFlag()), nil
 		}
 		// n still contains at least two values and cannot be reduced.
 		return true, n, nil
@@ -691,7 +724,27 @@ func (t *Trie) resolveAndTrack(n hashNode, prefix []byte) (node, error) {
 
 	// The returned node blob won't be changed afterward. No need to
 	// deep-copy the slice.
-	return decodeNodeUnsafe(n, blob)
+	return t.decodeNode(n, blob)
+}
+
+// decodeNode decodes a trie node from RLP, using the arena if available.
+func (t *Trie) decodeNode(hash, buf []byte) (node, error) {
+	n, err := decodeNodeUnsafe(hash, buf)
+	if err != nil || t.nodeArena == nil {
+		return n, err
+	}
+	// Re-allocate the decoded node from the arena to avoid heap allocation.
+	switch nn := n.(type) {
+	case *shortNode:
+		an := t.nodeArena.NewShortNode()
+		*an = *nn
+		return an, nil
+	case *fullNode:
+		an := t.nodeArena.NewFullNode()
+		*an = *nn
+		return an, nil
+	}
+	return n, nil
 }
 
 // deletedNodes returns a list of node paths, referring the nodes being deleted

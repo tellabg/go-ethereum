@@ -139,6 +139,7 @@ func (s *stateObject) getTrie() (Trie, error) {
 		if err != nil {
 			return nil, err
 		}
+		s.db.applyNodeArena(tr)
 		s.trie = tr
 	}
 	return s.trie, nil

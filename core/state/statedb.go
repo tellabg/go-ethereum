@@ -82,6 +82,11 @@ type StateDB struct {
 	reader     Reader
 	trie       Trie // it's resolved on first access
 
+	// nodeArena is an optional typed arena for trie node allocations.
+	// When set, it is passed to tries opened by this StateDB via
+	// SetNodeArena on the underlying StateTrie.
+	nodeArena *trie.NodeArena
+
 	// originalRoot is the pre-state root, before any changes were made.
 	// It will be updated when the Commit is called.
 	originalRoot common.Hash
@@ -198,6 +203,22 @@ func NewWithReader(root common.Hash, db Database, reader Reader) (*StateDB, erro
 		sdb.accessEvents = NewAccessEvents()
 	}
 	return sdb, nil
+}
+
+// SetNodeArena sets the typed arena for trie node allocations.
+// When set, all tries opened by this StateDB will use the arena
+// for fullNode and shortNode allocations.
+func (s *StateDB) SetNodeArena(arena *trie.NodeArena) {
+	s.nodeArena = arena
+}
+
+// applyNodeArena sets the node arena on a trie if the arena is configured.
+func (s *StateDB) applyNodeArena(tr Trie) {
+	if s.nodeArena != nil {
+		if st, ok := tr.(*trie.StateTrie); ok {
+			st.SetNodeArena(s.nodeArena)
+		}
+	}
 }
 
 // StartPrefetcher initializes a new trie prefetcher to pull in nodes from the
@@ -807,6 +828,7 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 			s.setError(err)
 			return common.Hash{}
 		}
+		s.applyNodeArena(tr)
 		s.trie = tr
 	}
 	// If there was a trie prefetcher operating, terminate it async so that the
@@ -1042,6 +1064,7 @@ func (s *StateDB) slowDeleteStorage(addr common.Address, addrHash common.Hash, r
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to open storage trie, err: %w", err)
 	}
+	s.applyNodeArena(tr)
 	it, err := tr.NodeIterator(nil)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to open storage iterator, err: %w", err)

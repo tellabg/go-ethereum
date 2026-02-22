@@ -32,6 +32,7 @@ import (
 	"github.com/ethereum/go-ethereum/internal/telemetry"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/trie"
 	"github.com/holiman/uint256"
 )
 
@@ -74,11 +75,22 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 		gp          = new(GasPool).AddGas(block.GasLimit())
 		alloc       = cfg.GetAllocator()
 	)
+	// Create a per-block node arena for trie node allocations when the
+	// arena allocator is enabled.
+	var nodeArena *trie.NodeArena
+	if _, ok := alloc.(*arena.BumpAllocator); ok {
+		nodeArena = trie.NewNodeArena()
+		statedb.SetNodeArena(nodeArena)
+	}
 	defer func() {
 		if ba, ok := alloc.(*arena.BumpAllocator); ok {
 			log.Info("Arena usage after block", "used", common.StorageSize(ba.Used()), "peak", common.StorageSize(ba.Peak()), "slabs", ba.SlabCount(), "total", common.StorageSize(ba.TotalCapacity()))
 		}
 		alloc.Reset()
+		if nodeArena != nil {
+			nodeArena.Reset()
+			statedb.SetNodeArena(nil)
+		}
 	}()
 
 	var tracingStateDB = vm.StateDB(statedb)
