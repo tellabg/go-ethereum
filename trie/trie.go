@@ -739,6 +739,17 @@ func (t *Trie) resolve(n node, prefix []byte) (node, error) {
 	return n, nil
 }
 
+// resolveNoTrack loads a node from the underlying store without tracking it
+// in the prevalue tracer. Use this for read-only operations where the node
+// does not need to be remembered for later diffing.
+func (t *Trie) resolveNoTrack(n hashNode, prefix []byte) (node, error) {
+	blob, err := t.reader.Node(prefix, common.BytesToHash(n))
+	if err != nil {
+		return nil, err
+	}
+	return decodeNodeUnsafe(n, blob)
+}
+
 // resolveAndTrack loads node from the underlying store with the given node hash
 // and path prefix and also tracks the loaded node blob in tracer treated as the
 // node's original value. The rlp-encoded blob is preferred to be loaded from
@@ -854,19 +865,29 @@ type WalkStats struct {
 // Walk recursively traverses the trie, resolving all nodes including
 // hashNodes and expiredNodes. It calls fn for each leaf found.
 // This triggers hash verification for expired nodes via cachedHash.
+// Note: Walk retains all resolved nodes in memory. For large tries,
+// use WalkLean instead to avoid OOM.
 func (t *Trie) Walk(fn func(path []byte, value []byte) error) (WalkStats, error) {
-	return t.walk(t.root, nil, fn)
+	return t.walk(t.root, nil, fn, false)
 }
 
-func (t *Trie) walk(n node, path []byte, fn func([]byte, []byte) error) (WalkStats, error) {
+// WalkLean is like Walk but does not retain resolved nodes in memory.
+// It resolves nodes without tracking them in the prevalue tracer and
+// does not mutate the trie structure, making it suitable for read-only
+// verification of large tries.
+func (t *Trie) WalkLean(fn func(path []byte, value []byte) error) (WalkStats, error) {
+	return t.walk(t.root, nil, fn, true)
+}
+
+func (t *Trie) walk(n node, path []byte, fn func([]byte, []byte) error, lean bool) (WalkStats, error) {
 	switch n := n.(type) {
 	case *shortNode:
-		return t.walk(n.Val, append(append([]byte{}, path...), n.Key...), fn)
+		return t.walk(n.Val, append(append([]byte{}, path...), n.Key...), fn, lean)
 	case *fullNode:
 		var stats WalkStats
 		for i, child := range n.Children[:16] {
 			if child != nil {
-				childStats, err := t.walk(child, append(append([]byte{}, path...), byte(i)), fn)
+				childStats, err := t.walk(child, append(append([]byte{}, path...), byte(i)), fn, lean)
 				if err != nil {
 					return stats, err
 				}
@@ -876,17 +897,25 @@ func (t *Trie) walk(n node, path []byte, fn func([]byte, []byte) error) (WalkSta
 		}
 		return stats, nil
 	case hashNode:
-		resolved, err := t.resolveAndTrack(n, path)
+		var (
+			resolved node
+			err      error
+		)
+		if lean {
+			resolved, err = t.resolveNoTrack(n, path)
+		} else {
+			resolved, err = t.resolveAndTrack(n, path)
+		}
 		if err != nil {
 			return WalkStats{}, err
 		}
-		return t.walk(resolved, path, fn)
+		return t.walk(resolved, path, fn, lean)
 	case *expiredNode:
 		resolved, err := resolveExpiredNodeData(n)
 		if err != nil {
 			return WalkStats{}, err
 		}
-		childStats, err := t.walk(resolved, path, fn)
+		childStats, err := t.walk(resolved, path, fn, lean)
 		childStats.ExpiredResolved++
 		return childStats, err
 	case valueNode:

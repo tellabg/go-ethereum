@@ -362,8 +362,11 @@ func archiveVerify(ctx *cli.Context) error {
 		lastLog           = time.Now()
 	)
 
-	// Walk the account trie — this resolves all expired nodes and verifies hashes
-	accountStats, err := accountTrie.Walk(func(path []byte, value []byte) error {
+	// Use an iterator for the account trie to avoid loading the entire trie
+	// into memory. Each account's storage trie is walked with WalkLean to
+	// avoid accumulating resolved nodes.
+	accountIt := trie.NewIterator(accountTrie.MustNodeIterator(nil))
+	for accountIt.Next() {
 		totalAccounts++
 		if time.Since(lastLog) > 30*time.Second {
 			log.Info("Verification progress",
@@ -377,54 +380,41 @@ func archiveVerify(ctx *cli.Context) error {
 
 		// Decode account to check for storage trie
 		var acc types.StateAccount
-		if err := rlp.DecodeBytes(value, &acc); err != nil {
+		if err := rlp.DecodeBytes(accountIt.Value, &acc); err != nil {
 			log.Warn("Failed to decode account", "err", err)
 			totalErrors++
-			return nil // continue walking
+			continue
 		}
+		totalLeaves++
 		if acc.Root == types.EmptyRootHash {
-			return nil
+			continue
 		}
 
-		// Open and walk storage trie.
-		// path is hex-nibble encoded (with a 16 terminator from the trie key),
-		// so convert nibble pairs back to the 32-byte account hash.
-		nibbles := path
-		if len(nibbles) > 0 && nibbles[len(nibbles)-1] == 16 {
-			nibbles = nibbles[:len(nibbles)-1]
-		}
-		keyBytes := make([]byte, len(nibbles)/2)
-		for i := 0; i < len(nibbles); i += 2 {
-			keyBytes[i/2] = nibbles[i]<<4 | nibbles[i+1]
-		}
-		accountHash := common.BytesToHash(keyBytes)
+		// Open and walk storage trie with WalkLean to avoid OOM.
+		accountHash := common.BytesToHash(accountIt.Key)
 		storageID := trie.StorageTrieID(root, accountHash, acc.Root)
 		storageTrie, err := trie.New(storageID, nodeDB)
 		if err != nil {
 			log.Warn("Failed to open storage trie", "account", accountHash, "err", err)
 			totalErrors++
-			return nil
+			continue
 		}
 
-		storageStats, err := storageTrie.Walk(func(spath []byte, svalue []byte) error {
+		storageStats, err := storageTrie.WalkLean(func(spath []byte, svalue []byte) error {
 			return nil
 		})
 		if err != nil {
 			log.Warn("Storage trie walk failed", "account", accountHash, "err", err)
 			totalErrors++
-			return nil
+			continue
 		}
 		totalStorageTries++
 		totalLeaves += storageStats.Leaves
 		totalExpired += storageStats.ExpiredResolved
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("account trie walk failed: %w", err)
 	}
-
-	totalLeaves += accountStats.Leaves
-	totalExpired += accountStats.ExpiredResolved
+	if err := accountIt.Err; err != nil {
+		return fmt.Errorf("account trie iteration failed: %w", err)
+	}
 
 	log.Info("Archive verification complete",
 		"accounts", totalAccounts,
