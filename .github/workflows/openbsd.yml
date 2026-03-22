@@ -1,0 +1,28 @@
+on:
+  push:
+    branches:
+      - freebsd-github-action
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: OpenBSD-build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: false
+
+    - name: Test in OpenBSD
+      id: test
+      uses: vmactions/openbsd-vm@v1
+      with:
+        release: "7.8"
+        usesh: true
+        prepare: |
+          pkg_add go
+        run: |
+          uname -a
+          go version
+          go run ./build/ci.go test -p 8
