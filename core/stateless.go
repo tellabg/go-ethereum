@@ -18,6 +18,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/lru"
@@ -27,30 +28,20 @@ import (
 	"github.com/ethereum/go-ethereum/core/stateless"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
-	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/triedb"
 )
 
-// ExecuteStateless runs a stateless execution based on a witness, verifies
-// everything it can locally and returns the state root and receipt root, that
-// need the other side to explicitly check.
+// ExecuteStateless runs a stateless execution based on a witness, fully
+// self-validating the block (header, body, state root and receipt root).
 //
 // This method is a bit of a sore thumb here, but:
-//   - It cannot be placed in core/stateless, because state.New prodces a circular dep
+//   - It cannot be placed in core/stateless, because state.New produces a circular dep
 //   - It cannot be placed outside of core, because it needs to construct a dud headerchain
 //
 // TODO(karalabe): Would be nice to resolve both issues above somehow and move it.
 func ExecuteStateless(ctx context.Context, config *params.ChainConfig, vmconfig vm.Config, block *types.Block, witness *stateless.Witness) (common.Hash, common.Hash, error) {
-	// Sanity check if the supplied block accidentally contains a set root or
-	// receipt hash. If so, be very loud, but still continue.
-	if block.Root() != (common.Hash{}) {
-		log.Error("stateless runner received state root it's expected to calculate (faulty consensus client)", "block", block.Number())
-	}
-	if block.ReceiptHash() != (common.Hash{}) {
-		log.Error("stateless runner received receipt root it's expected to calculate (faulty consensus client)", "block", block.Number())
-	}
 	// Create and populate the state database to serve as the stateless backend
 	memdb := witness.MakeHashDB()
 	db, err := state.New(witness.Root(), state.NewDatabase(triedb.NewDatabase(memdb, triedb.HashDefaults), state.NewCodeDB(memdb)))
@@ -58,25 +49,40 @@ func ExecuteStateless(ctx context.Context, config *params.ChainConfig, vmconfig 
 		return common.Hash{}, common.Hash{}, err
 	}
 	// Create a blockchain that is idle, but can be used to access headers through
+	engine := beacon.New(ethash.NewFaker())
 	chain := &HeaderChain{
 		config:      config,
 		chainDb:     memdb,
 		headerCache: lru.NewCache[common.Hash, *types.Header](256),
-		engine:      beacon.New(ethash.NewFaker()),
+		engine:      engine,
 	}
+	// Pre-execution validation: verify the block header and body
+	if err := engine.VerifyHeader(chain, block.Header()); err != nil {
+		return common.Hash{}, common.Hash{}, fmt.Errorf("header verification failed: %w", err)
+	}
+	validator := NewBlockValidator(config, nil) // No chain needed for body validation
+	if err := validator.ValidateBody(block); err != nil {
+		return common.Hash{}, common.Hash{}, fmt.Errorf("body validation failed: %w", err)
+	}
+	// Execute the block
 	processor := NewStateProcessor(chain)
-	validator := NewBlockValidator(config, nil) // No chain, we only validate the state, not the block
-
-	// Run the stateless blocks processing and self-validate certain fields
 	res, err := processor.Process(ctx, block, db, vmconfig)
 	if err != nil {
 		return common.Hash{}, common.Hash{}, err
 	}
+	// Post-execution validation: gas used, bloom filter
 	if err = validator.ValidateState(block, db, res, true); err != nil {
 		return common.Hash{}, common.Hash{}, err
 	}
-	// Almost everything validated, but receipt and state root needs to be returned
+	// Compute and verify the state root and receipt root
 	receiptRoot := types.DeriveSha(res.Receipts, trie.NewStackTrie(nil))
 	stateRoot := db.IntermediateRoot(config.IsEIP158(block.Number()))
+
+	if stateRoot != block.Root() {
+		return stateRoot, receiptRoot, fmt.Errorf("state root mismatch: computed %x, expected %x", stateRoot, block.Root())
+	}
+	if receiptRoot != block.ReceiptHash() {
+		return stateRoot, receiptRoot, fmt.Errorf("receipt root mismatch: computed %x, expected %x", receiptRoot, block.ReceiptHash())
+	}
 	return stateRoot, receiptRoot, nil
 }
